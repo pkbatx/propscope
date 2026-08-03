@@ -51,6 +51,32 @@ docker compose exec collector python -c \
   "import urllib.request;print(urllib.request.urlopen('http://localhost:8000/api/sources').read().decode())"
 ```
 
+### On the web
+
+Two optional services, both off by default:
+
+```bash
+docker compose --profile web  up -d   # static page on 127.0.0.1:8080
+docker compose --profile term up -d   # live TUI in a browser on 127.0.0.1:7681
+```
+
+`web` regenerates a standalone HTML page every 5 minutes and serves it with
+darkhttpd. All five tabs become sections of one scrollable page, rendered at two
+widths with a CSS media query picking the narrow one on phones. A viewer costs a
+single static GET, so it is safe to publish without auth.
+
+`term` runs the real interactive TUI through [ttyd](https://github.com/tsl0922/ttyd).
+It is **not** equivalent in risk: each browser tab forks a `propscope` and holds
+database connections, so it ships with `--max-clients 4` and a memory limit.
+Publish it unbounded and a crawler can exhaust your postgres connections. Put it
+behind auth (`ttyd --credential`) or your proxy's access control.
+
+You can also generate the page yourself without either container:
+
+```bash
+propscope -html -width 116 -narrow 96 -refresh 300 > index.html
+```
+
 ### Running the TUI outside Docker
 
 The TUI is a single static binary and only needs to reach postgres. It follows

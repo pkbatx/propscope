@@ -99,8 +99,13 @@ func (m model) chrome(body string) string {
 
 	title := lipgloss.NewStyle().Foreground(lipgloss.Color("16")).
 		Background(cAccent).Bold(true).Render(" propscope ")
-	sub := stDim.Render(" HF propagation · Austin TX")
-	left := title + sub
+	left := title
+	// Shed the subtitle before the numbers: on a narrow screen "HF propagation
+	// · Austin TX" is the least useful thing on the line, and something has to
+	// go or the header overruns and pushes the layout sideways.
+	if m.w >= 92 {
+		left += stDim.Render(" HF propagation · Austin TX")
+	}
 
 	right := stFaint.Render("no solar data")
 	if sol.SFI6h > 0 {
@@ -116,12 +121,18 @@ func (m model) chrome(body string) string {
 	}
 	// The clock is the operator's, in both the timezone the hobby uses and the
 	// one they actually live in.
-	right += stFaint.Render("   ") + stWhite.Render(time.Now().UTC().Format("15:04Z")) +
-		stFaint.Render(" / ") + stDim.Render(time.Now().In(displayLoc).Format("15:04 MST"))
+	right += stFaint.Render("   ") + stWhite.Render(time.Now().UTC().Format("15:04Z"))
+	if m.w >= 72 {
+		right += stFaint.Render(" / ") +
+			stDim.Render(time.Now().In(displayLoc).Format("15:04 MST"))
+	}
 
+	// If it still will not fit, drop the right-hand block entirely rather than
+	// overrunning. A header one column too wide shifts every line below it.
 	pad := m.w - lipgloss.Width(left) - lipgloss.Width(right)
 	if pad < 1 {
-		pad = 1
+		right = ""
+		pad = maxInt(m.w-lipgloss.Width(left), 0)
 	}
 	b.WriteString(left + strings.Repeat(" ", pad) + right + "\n")
 
@@ -191,17 +202,21 @@ func (m model) viewHome() string {
 		return "\n" + stDim.Render("  waiting for the collector's first run…") + "\n"
 	}
 
-	leftW := m.w * 62 / 100
-	if leftW < 40 {
-		leftW = 40
+	// Side by side needs 40 for the band table and 30 for the solar panel plus
+	// a gutter. Below that they are stacked instead of being squeezed into
+	// something neither of them fits in -- which is what a phone gets.
+	var top string
+	if m.w >= 74 {
+		leftW := m.w * 62 / 100
+		if leftW < 40 {
+			leftW = 40
+		}
+		rightW := m.w - leftW - 2
+		top = lipgloss.JoinHorizontal(lipgloss.Top,
+			m.homeBands(leftW), "  ", m.homeSolar(rightW))
+	} else {
+		top = m.homeBands(m.w) + "\n" + m.homeSolar(m.w)
 	}
-	rightW := m.w - leftW - 2
-	if rightW < 30 {
-		rightW = 30
-	}
-
-	top := lipgloss.JoinHorizontal(lipgloss.Top,
-		m.homeBands(leftW), "  ", m.homeSolar(rightW))
 
 	var b strings.Builder
 	b.WriteString(top + "\n")
@@ -413,9 +428,15 @@ func (m model) homeSolar(w int) string {
 			Render(fmt.Sprintf("%6.1f", sol.HAF)) + " " +
 		gauge(sol.HAF, 20, gw, coolWarm) + " " + stFaint.Render("MHz LUF") + "\n")
 
-	b.WriteString(stFaint.Render(fmt.Sprintf(" SWPC %s: flux %.0f · SSN %d · C%d M%d X%d",
+	// This panel can be as narrow as ~34 columns when the layout splits, so the
+	// daily summary needs a short form rather than a fixed one that overruns.
+	daily := fmt.Sprintf(" SWPC %s: flux %.0f · SSN %d · C%d M%d X%d",
 		sol.Day.Format("Jan 02"), sol.DailyFlux, sol.DailySSN,
-		sol.XrayC, sol.XrayM, sol.XrayX)) + "\n")
+		sol.XrayC, sol.XrayM, sol.XrayX)
+	if len([]rune(daily)) > w {
+		daily = fmt.Sprintf(" SWPC: flux %.0f · SSN %d", sol.DailyFlux, sol.DailySSN)
+	}
+	b.WriteString(stFaint.Render(daily) + "\n")
 
 	// --- the station the band column speaks for ------------------------------
 	b.WriteString("\n" + section("IONOSPHERE", "reference sounding", cCyan, w) + "\n")
@@ -430,8 +451,11 @@ func (m model) homeSolar(w int) string {
 	}
 	b.WriteString(" " + lipgloss.NewStyle().Foreground(cGreenB).Bold(true).
 		Render(ref.Code) + " " + stDim.Render(name) + "\n")
-	b.WriteString(" " + stFaint.Render(fmt.Sprintf("%.0f km away · sounded %s ago",
-		ref.KM, fmtAge(ref.Age()))) + "\n")
+	line := fmt.Sprintf("%.0f km away · sounded %s ago", ref.KM, fmtAge(ref.Age()))
+	if len([]rune(line))+1 > w {
+		line = fmt.Sprintf("%.0f km · %s", ref.KM, fmtAge(ref.Age()))
+	}
+	b.WriteString(" " + stFaint.Render(line) + "\n")
 	b.WriteString(" " + stFaint.Render("foF2 ") + scaled(ref.FoF2, 2, 14, "%5.2f") +
 		stFaint.Render("  MUF ") + scaled(ref.MUFD, 5, 40, "%5.2f") +
 		stFaint.Render("  foEs ") + scaled(ref.FoEs, 0, 10, "%5.2f") + "\n")
@@ -472,7 +496,8 @@ func (m model) viewBands() string {
 	// Bands stay in FREQUENCY order rather than sorted by traffic: it keeps the
 	// spectrum colours running top to bottom as a gradient, and it means a band
 	// does not jump rows between refreshes.
-	barW := m.w - 58
+	// 59 = every fixed column and separator in the row format below.
+	barW := m.w - 59
 	if barW < 12 {
 		barW = 12
 	}
@@ -685,10 +710,18 @@ func (m model) viewWaterfall() string {
 		f := float64(i) / float64(legendW-1)
 		b.WriteString(lipgloss.NewStyle().Foreground(heatAt(f)).Render(shadeChar(f)))
 	}
-	b.WriteString(stFaint.Render(" busy   each band scaled to its own 24h peak") + "\n")
-	b.WriteString(stFaint.Render(
-		"  higher bands on top \u00b7 one column per time bucket, oldest left \u00b7 "+
-			"right column is that band's peak spots/10min") + "\n")
+	legend := " busy   each band scaled to its own 24h peak"
+	if m.w < 80 {
+		legend = " busy"
+	}
+	b.WriteString(stFaint.Render(legend) + "\n")
+	if m.w >= 100 {
+		b.WriteString(stFaint.Render(
+			"  higher bands on top \u00b7 one column per time bucket, oldest left \u00b7 "+
+				"right column is that band's peak spots/10min") + "\n")
+	} else {
+		b.WriteString(stFaint.Render("  higher bands on top \u00b7 oldest left") + "\n")
+	}
 	return b.String()
 }
 
@@ -732,16 +765,35 @@ func (m model) viewSolar() string {
 	if sol.HAF > 0 {
 		absC = rampColor(coolWarm, sol.HAF/20)
 	}
+	// This row's trailing note is far longer than the others', so it gets its
+	// own gauge width rather than overflowing the line.
+	absNote := "  MHz cutoff at the QTH (0 = no D layer, i.e. night)"
+	if m.w < 110 {
+		absNote = "  MHz LUF at QTH"
+	}
+	absGW := m.w - 26 - len(absNote)
+	if absGW < 8 {
+		absGW = 8
+	}
+	if absGW > gw {
+		absGW = gw
+	}
 	b.WriteString("  " + stDim.Render("absorption      ") +
 		lipgloss.NewStyle().Foreground(absC).Bold(true).
 			Render(fmt.Sprintf("%6.1f", sol.HAF)) + "  " +
-		gauge(sol.HAF, 20, gw, coolWarm) +
-		stFaint.Render("  MHz cutoff at the QTH (0 = no D layer, i.e. night)") + "\n")
+		gauge(sol.HAF, 20, absGW, coolWarm) +
+		stFaint.Render(absNote) + "\n")
 
-	b.WriteString(stFaint.Render(fmt.Sprintf(
+	off := fmt.Sprintf(
 		"  official SWPC daily for %s: flux %.0f · sunspot number %d · flares C%d M%d X%d",
 		sol.Day.Format("Jan 02"), sol.DailyFlux, sol.DailySSN,
-		sol.XrayC, sol.XrayM, sol.XrayX)) + "\n")
+		sol.XrayC, sol.XrayM, sol.XrayX)
+	if len([]rune(off)) > m.w {
+		off = fmt.Sprintf("  SWPC %s: flux %.0f · SSN %d · C%d M%d X%d",
+			sol.Day.Format("Jan 02"), sol.DailyFlux, sol.DailySSN,
+			sol.XrayC, sol.XrayM, sol.XrayX)
+	}
+	b.WriteString(stFaint.Render(off) + "\n")
 
 	// --- effective SSN over the last week ------------------------------------
 	chartH := m.h - 26
@@ -971,9 +1023,13 @@ func (m model) viewIono() string {
 		// fact, so it belongs as a footnote here rather than as a standing
 		// warning on the dashboard.
 		if m.snap.AustinKnown {
-			b.WriteString(stFaint.Render(fmt.Sprintf(
+			note := fmt.Sprintf(
 				"  AU930 Austin TX (15 km) has not reported for %s \u2014 hence the distance above.",
-				fmtAge(m.snap.AustinAge))) + "\n")
+				fmtAge(m.snap.AustinAge))
+			if len([]rune(note)) > m.w {
+				note = fmt.Sprintf("  AU930 Austin TX silent %s", fmtAge(m.snap.AustinAge))
+			}
+			b.WriteString(stFaint.Render(note) + "\n")
 		}
 	}
 	return b.String()

@@ -228,6 +228,9 @@ func main() {
 	width := flag.Int("width", 120, "render width for -dump")
 	height := flag.Int("height", 46, "render height for -dump")
 	plain := flag.Bool("plain", false, "-dump without colour escapes")
+	toHTML := flag.Bool("html", false, "render a standalone HTML page to stdout and exit")
+	narrow := flag.Int("narrow", 96, "second, phone-sized render width for -html")
+	refresh := flag.Int("refresh", 300, "meta-refresh interval in seconds for -html")
 	flag.Parse()
 
 	ensureColor()
@@ -248,6 +251,26 @@ func main() {
 			err, getenv("PGDATABASE", "propscope"), getenv("PGHOST", "127.0.0.1"),
 			getenv("PGPORT", "5432"), getenv("PGUSER", "propscope"))
 		os.Exit(1)
+	}
+
+	if *toHTML {
+		// Force truecolor regardless of where stdout is pointing: the target is
+		// a browser, not this terminal, so the usual "is it a TTY" reasoning
+		// does not apply and quantising to 256 would throw away colour the page
+		// can display perfectly well.
+		lipgloss.SetColorProfile(termenv.TrueColor)
+		m := initialModel(pool)
+		m.ready, m.loading = true, false
+		m.snap = Load(ctx, pool)
+		if m.snap.Err != nil {
+			fmt.Fprintf(os.Stderr, "propscope: %v\n", m.snap.Err)
+			os.Exit(1)
+		}
+		if err := WriteHTML(os.Stdout, m, *width, *narrow, *height, *refresh); err != nil {
+			fmt.Fprintf(os.Stderr, "propscope: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	if *dump {

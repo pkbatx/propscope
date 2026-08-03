@@ -1,0 +1,24 @@
+# propscope/term -- the live TUI in a browser tab, via ttyd.
+#
+# Unlike the static page this DOES spawn a process and take database
+# connections per viewer, so whoever runs it should bound it: ttyd's
+# --max-clients, a container memory limit, and a small pool (propscope opens at
+# most 2 connections and one is enough here). Publishing it unbounded lets a
+# crawler starve whatever else shares that postgres.
+FROM golang:1.25-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY *.go ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/propscope .
+
+# ---------------------------------------------------------------------------
+FROM tsl0922/ttyd:latest
+COPY --from=build /out/propscope /usr/local/bin/propscope
+
+# ttyd runs exactly one command and propscope has no shell escape: its only keys
+# are tab switching, refresh, help and quit. There is no path from the browser
+# to a prompt.
+ENV MAX_CLIENTS=4
+EXPOSE 7681
+ENTRYPOINT ["/bin/sh", "-c", "exec ttyd --writable --max-clients ${MAX_CLIENTS} --port 7681 --interface 0.0.0.0 propscope"]

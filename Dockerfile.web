@@ -1,0 +1,26 @@
+# propscope/web -- regenerates the static page on a timer and serves it.
+#
+# There is no application server here on purpose. The page is a file; a viewer
+# costs one static GET and no process, no database connection and no websocket.
+# That is what makes it safe to publish without auth: there is nothing on the
+# other end for a crawler to exhaust.
+FROM golang:1.25-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY *.go ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/propscope .
+
+# ---------------------------------------------------------------------------
+FROM alpine:3.21
+# darkhttpd, not busybox httpd: Alpine's busybox is compiled WITHOUT the httpd
+# applet, so `busybox httpd` fails at runtime with "applet not found" rather
+# than at build time. darkhttpd is ~20 KB, serves static files and does nothing
+# else, which is exactly the surface area this should have.
+RUN apk add --no-cache ca-certificates darkhttpd && adduser -D -u 10001 propscope
+COPY --from=build /out/propscope /usr/local/bin/propscope
+COPY docker/web-entrypoint.sh /usr/local/bin/web-entrypoint
+RUN chmod +x /usr/local/bin/web-entrypoint && mkdir -p /srv && chown 10001 /srv
+USER 10001
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/web-entrypoint"]

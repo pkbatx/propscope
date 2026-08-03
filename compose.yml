@@ -103,5 +103,63 @@ services:
     stdin_open: true
     tty: true
 
+  # The static page: regenerated on a timer, served as a file. A viewer costs
+  # one GET -- no process, no database connection, no websocket -- which is what
+  # makes it safe to put on the public internet without auth.
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    image: propscope/web:1.0
+    profiles: ["web"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: ${PGDATABASE:-propscope}
+      PGUSER: ${PGUSER:-propscope}
+      PGPASSWORD: ${PGPASSWORD:?set PGPASSWORD in .env}
+      PROPSCOPE_TZ: ${PROPSCOPE_TZ:-America/Chicago}
+      REFRESH: ${WEB_REFRESH:-300}
+      WIDTH: "116"
+      # 96 is the narrowest the two-column layout fits in. Below that panels
+      # overrun each other; the page scrolls horizontally on a phone instead.
+      NARROW: "96"
+      TZ: UTC
+    mem_limit: 64m
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8080}:8080"
+
+  # The live TUI in a browser. Unlike `web` this forks a process and takes
+  # database connections per viewer, so it is bounded. Put it behind auth if you
+  # publish it -- ttyd has --credential, or use whatever proxy you already run.
+  term:
+    build:
+      context: .
+      dockerfile: Dockerfile.term
+    image: propscope/term:1.0
+    profiles: ["term"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: ${PGDATABASE:-propscope}
+      PGUSER: ${PGUSER:-propscope}
+      PGPASSWORD: ${PGPASSWORD:?set PGPASSWORD in .env}
+      PROPSCOPE_TZ: ${PROPSCOPE_TZ:-America/Chicago}
+      TERM: xterm-256color
+      COLORTERM: truecolor
+      MAX_CLIENTS: ${TERM_MAX_CLIENTS:-4}
+      TZ: UTC
+    mem_limit: 128m
+    ports:
+      - "127.0.0.1:${TERM_PORT:-7681}:7681"
+
 volumes:
   pgdata:
