@@ -1,0 +1,847 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/NimbleMarkets/ntcharts/barchart"
+	"github.com/NimbleMarkets/ntcharts/linechart/timeserieslinechart"
+	"github.com/NimbleMarkets/ntcharts/sparkline"
+	"github.com/charmbracelet/lipgloss"
+)
+
+var (
+	cAccent = lipgloss.Color("39")
+	cDim    = lipgloss.Color("245")
+	cFaint  = lipgloss.Color("240")
+	cRed    = lipgloss.Color("203")
+	cYellow = lipgloss.Color("220")
+	cCyan   = lipgloss.Color("87")
+	cGreenB = lipgloss.Color("47")
+	cWhite  = lipgloss.Color("252")
+
+	stTitle  = lipgloss.NewStyle().Foreground(cAccent).Bold(true)
+	stDim    = lipgloss.NewStyle().Foreground(cDim)
+	stFaint  = lipgloss.NewStyle().Foreground(cFaint)
+	stWhite  = lipgloss.NewStyle().Foreground(cWhite)
+	stHeader = lipgloss.NewStyle().Foreground(cDim).Bold(true)
+	stErr    = lipgloss.NewStyle().Foreground(cRed).Bold(true)
+	stWarn   = lipgloss.NewStyle().Foreground(cYellow)
+)
+
+// displayLoc is the QTH's wall-clock timezone, which is deliberately NOT the
+// host's. Servers run UTC -- this one does, and a container will too -- while
+// the operator is in Austin, so time.Local would just print Zulu twice. Set
+// PROPSCOPE_TZ to move the station.
+//
+// The tzdata database is embedded (see the blank import in main.go) so this
+// resolves identically on a distroless container with no /usr/share/zoneinfo.
+var displayLoc = func() *time.Location {
+	name := os.Getenv("PROPSCOPE_TZ")
+	if name == "" {
+		name = "America/Chicago"
+	}
+	if loc, err := time.LoadLocation(name); err == nil {
+		return loc
+	}
+	return time.Local
+}()
+
+// fmtZL renders an instant as both Zulu and QTH wall time.
+//
+// Ham radio runs on UTC and every upstream here publishes it, but "is 20m open
+// yet" is a question about local daylight. Showing one without the other means
+// doing the arithmetic in your head at exactly the moment you did not want to.
+func fmtZL(t time.Time) string {
+	return t.UTC().Format("15:04Z") + " / " + t.In(displayLoc).Format("15:04 MST")
+}
+
+func fmtAge(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+	}
+	return fmt.Sprintf("%dd", int(d.Hours()/24))
+}
+
+// section draws a coloured title bar that fills the width. Cheaper and more
+// robust than boxing wide content -- no border-width arithmetic to get wrong.
+func section(title, subtitle string, c lipgloss.Color, w int) string {
+	head := lipgloss.NewStyle().Foreground(c).Bold(true).Render("▌ " + title)
+	sub := ""
+	if subtitle != "" {
+		sub = stFaint.Render("  " + subtitle)
+	}
+	used := lipgloss.Width(head) + lipgloss.Width(sub)
+	fill := w - used - 1
+	if fill < 1 {
+		fill = 1
+	}
+	return head + sub + " " +
+		lipgloss.NewStyle().Foreground(lipgloss.Color("236")).
+			Render(strings.Repeat("─", fill))
+}
+
+// ------------------------------------------------------------------ chrome
+
+func (m model) chrome(body string) string {
+	var b strings.Builder
+	sol := m.snap.Solar
+
+	title := lipgloss.NewStyle().Foreground(lipgloss.Color("16")).
+		Background(cAccent).Bold(true).Render(" propscope ")
+	sub := stDim.Render(" HF propagation · Austin TX")
+	left := title + sub
+
+	right := stFaint.Render("no solar data")
+	if sol.SFI6h > 0 {
+		right = stFaint.Render("SFI ") +
+			lipgloss.NewStyle().Foreground(rampColor(coolWarm,
+				(sol.SFI6h-70)/200)).Bold(true).Render(fmt.Sprintf("%.0f", sol.SFI6h)) +
+			stFaint.Render("  SSN ") +
+			lipgloss.NewStyle().Foreground(rampColor(coolWarm,
+				sol.SSN6h/200)).Bold(true).Render(fmt.Sprintf("%.0f", sol.SSN6h)) +
+			stFaint.Render("  Kp ") +
+			lipgloss.NewStyle().Foreground(kpColor(sol.Kp)).Bold(true).
+				Render(fmt.Sprintf("%.1f", sol.Kp))
+	}
+	// The clock is the operator's, in both the timezone the hobby uses and the
+	// one they actually live in.
+	right += stFaint.Render("   ") + stWhite.Render(time.Now().UTC().Format("15:04Z")) +
+		stFaint.Render(" / ") + stDim.Render(time.Now().In(displayLoc).Format("15:04 MST"))
+
+	pad := m.w - lipgloss.Width(left) - lipgloss.Width(right)
+	if pad < 1 {
+		pad = 1
+	}
+	b.WriteString(left + strings.Repeat(" ", pad) + right + "\n")
+
+	var tabs []string
+	for i := tab(0); i < numTabs; i++ {
+		if i == m.tab {
+			tabs = append(tabs, lipgloss.NewStyle().
+				Foreground(lipgloss.Color("16")).Background(cAccent).
+				Bold(true).Padding(0, 1).Render(tabNames[i]))
+		} else {
+			tabs = append(tabs, lipgloss.NewStyle().Foreground(cFaint).
+				Padding(0, 1).Render(tabNames[i]))
+		}
+	}
+	b.WriteString(strings.Join(tabs, "") + "\n\n")
+	b.WriteString(body)
+
+	help := stFaint.Render("tab/1-5 · r refresh · ? help · q quit")
+	var stat string
+	switch {
+	case m.lastErr != nil:
+		stat = stErr.Render("ERROR: " + m.lastErr.Error())
+	case m.loading:
+		stat = stWarn.Render("refreshing…")
+	default:
+		stat = stFaint.Render("updated " + fmtAge(time.Since(m.snap.At)) + " ago")
+	}
+	pad = m.w - lipgloss.Width(help) - lipgloss.Width(stat)
+	if pad < 1 {
+		pad = 1
+	}
+	b.WriteString("\n" + help + strings.Repeat(" ", pad) + stat)
+	return b.String()
+}
+
+func (m model) viewHelp() string {
+	l := func(b, text string) string {
+		return "  " + b + "  " + stDim.Render(text) + "\n"
+	}
+	return stTitle.Render("propscope — what the numbers mean") + "\n\n" +
+		section("BAND STATUS", "", cAccent, m.w) + "\n" +
+		l(statusBadge(StatusNVIS), "at or below foF2 — reflects straight down. Local AND DX.") +
+		l(statusBadge(StatusDX), "above foF2, at or below MUF(3000). Skip only; dead zone around you.") +
+		l(statusBadge(StatusMarginal), "within 15% above MUF. MUF is a median — opens on a good day.") +
+		l(statusBadge(StatusES), "F2 cannot carry it, sporadic E can (up to ~5× foEs).") +
+		l(statusBadge(StatusAbsorbed), "below the D-region absorption limit.") +
+		l(statusBadge(StatusClosed), "above MUF with no Es.") +
+		"\n" + section("SOURCES", "", cCyan, m.w) + "\n" +
+		stDim.Render(
+			"  spots/band   wspr.live — every WSPR reception report worldwide, 10-min buckets.\n"+
+				"  SFI / SSN    prop.kc2g.com effective sunspot number, fitted from real soundings.\n"+
+				"  daily SSN    NOAA SWPC daily solar data report, 30-day history.\n"+
+				"  foF2 / MUF   GIRO ionosondes via prop.kc2g.com.\n"+
+				"  absorption   NOAA D-RAP, sampled at the Austin QTH.") + "\n\n" +
+		stWarn.Render("  Band status is a rule of thumb from ONE remote station's sounding.") + "\n" +
+		stWarn.Render("  A decision aid, not a forecast.") + "\n\n" +
+		stFaint.Render("  press ? to go back")
+}
+
+// -------------------------------------------------------------------- HOME
+
+// viewHome is the compressed everything-at-once view: what is open, what the
+// sun is doing, how the day has gone, and which station said so. The other tabs
+// exist to expand one of these four; nothing here should need scrolling.
+func (m model) viewHome() string {
+	if len(m.snap.Spots) == 0 && len(m.snap.ESSN) == 0 {
+		return "\n" + stDim.Render("  waiting for the collector's first run…") + "\n"
+	}
+
+	leftW := m.w * 62 / 100
+	if leftW < 40 {
+		leftW = 40
+	}
+	rightW := m.w - leftW - 2
+	if rightW < 30 {
+		rightW = 30
+	}
+
+	top := lipgloss.JoinHorizontal(lipgloss.Top,
+		m.homeBands(leftW), "  ", m.homeSolar(rightW))
+
+	var b strings.Builder
+	b.WriteString(top + "\n")
+
+	// A short waterfall: enough to read today's shape without the detail tab.
+	if len(m.snap.HistTimes) >= 2 {
+		gridW := m.w - 9
+		if gridW > len(m.snap.HistTimes) {
+			gridW = len(m.snap.HistTimes)
+		}
+		if gridW > 20 {
+			span := m.snap.HistTimes[len(m.snap.HistTimes)-1].Sub(m.snap.HistTimes[0])
+			b.WriteString(section("24H WATERFALL",
+				fmt.Sprintf("%s · press 3 to expand", fmtAge(span)), cAccent, m.w) + "\n")
+			for _, r := range m.buildWaterfall(gridW) {
+				b.WriteString(lipgloss.NewStyle().Foreground(bandColor(r.Band.WSPR)).
+					Bold(true).Render(fmt.Sprintf("%6s ", r.Band.Name)) + r.Cells + "\n")
+			}
+			b.WriteString(m.waterfallAxis(gridW, 7, true) + "\n")
+		}
+	}
+	return b.String()
+}
+
+func (m model) homeBands(w int) string {
+	var b strings.Builder
+	if len(m.snap.Spots) == 0 {
+		return section("BANDS NOW", "no data", cAccent, w) + "\n"
+	}
+
+	spotsByBand := map[int]int64{}
+	for _, s := range m.snap.Spots {
+		spotsByBand[s.Band] = s.Spots
+	}
+	b.WriteString(section("BANDS NOW", fmtZL(m.snap.SpotBucket), cAccent, w) + "\n")
+
+	barW := w - 26
+	if barW < 8 {
+		barW = 8
+	}
+	var bars []barchart.BarData
+	for _, bd := range Bands {
+		bars = append(bars, barchart.BarData{
+			Label: bd.Name,
+			Values: []barchart.BarValue{{
+				Name:  "spots",
+				Value: float64(spotsByBand[bd.WSPR]),
+				Style: lipgloss.NewStyle().Foreground(bandColor(bd.WSPR)),
+			}},
+		})
+	}
+	bc := barchart.New(barW, len(bars),
+		barchart.WithHorizontalBars(), barchart.WithNoAxis(),
+		barchart.WithNoAutoBarWidth(), barchart.WithBarWidth(1),
+		barchart.WithBarGap(0))
+	bc.PushAll(bars)
+	bc.Draw()
+	lines := strings.Split(bc.View(), "\n")
+
+	ref, _ := m.snap.Reference()
+	for i, bd := range Bands {
+		bar := ""
+		if i < len(lines) {
+			bar = lines[i]
+		}
+		n := spotsByBand[bd.WSPR]
+		count := stFaint.Render(fmt.Sprintf("%6d", n))
+		if n > 0 {
+			count = stWhite.Render(fmt.Sprintf("%6d", n))
+		}
+		b.WriteString(" " +
+			lipgloss.NewStyle().Foreground(bandColor(bd.WSPR)).Bold(true).
+				Render(fmt.Sprintf("%5s", bd.Name)) + " " +
+			bar + " " + count + " " +
+			statusBadge(Classify(bd, ref, m.snap.Solar.HAF)) + "\n")
+	}
+	return b.String()
+}
+
+func (m model) homeSolar(w int) string {
+	var b strings.Builder
+	sol := m.snap.Solar
+	gw := w - 24
+	if gw < 8 {
+		gw = 8
+	}
+
+	b.WriteString(section("SOLAR", fmtAge(time.Since(sol.ESSNTime))+" old", cYellow, w) + "\n")
+	row := func(label string, v float64, max float64, ramp []lipgloss.Color, note string) {
+		b.WriteString(" " + stDim.Render(fmt.Sprintf("%-5s", label)) +
+			lipgloss.NewStyle().Foreground(rampColor(ramp, v/max)).Bold(true).
+				Render(fmt.Sprintf("%6.1f", v)) + " " +
+			gauge(v, max, gw, ramp) + " " + note + "\n")
+	}
+	row("SFI", sol.SFI6h, 300, coolWarm, stFaint.Render(fmt.Sprintf("24h %.0f", sol.SFI24h)))
+	row("SSN", sol.SSN6h, 200, coolWarm, stFaint.Render(fmt.Sprintf("24h %.0f", sol.SSN24h)))
+
+	kpRamp := []lipgloss.Color{
+		lipgloss.Color("47"), lipgloss.Color("191"), lipgloss.Color("220"),
+		lipgloss.Color("208"), lipgloss.Color("202"), lipgloss.Color("196")}
+	b.WriteString(" " + stDim.Render(fmt.Sprintf("%-5s", "Kp")) +
+		lipgloss.NewStyle().Foreground(kpColor(sol.Kp)).Bold(true).
+			Render(fmt.Sprintf("%6.2f", sol.Kp)) + " " +
+		gauge(sol.Kp, 9, gw, kpRamp) + " " +
+		lipgloss.NewStyle().Foreground(kpColor(sol.Kp)).Render(kpLabel(sol.Kp)) + "\n")
+
+	b.WriteString(" " + stDim.Render(fmt.Sprintf("%-5s", "absrb")) +
+		lipgloss.NewStyle().Foreground(rampColor(coolWarm, sol.HAF/20)).Bold(true).
+			Render(fmt.Sprintf("%6.1f", sol.HAF)) + " " +
+		gauge(sol.HAF, 20, gw, coolWarm) + " " + stFaint.Render("MHz LUF") + "\n")
+
+	b.WriteString(stFaint.Render(fmt.Sprintf(" SWPC %s: flux %.0f · SSN %d · C%d M%d X%d",
+		sol.Day.Format("Jan 02"), sol.DailyFlux, sol.DailySSN,
+		sol.XrayC, sol.XrayM, sol.XrayX)) + "\n")
+
+	// --- the station the band column speaks for ------------------------------
+	b.WriteString("\n" + section("IONOSPHERE", "reference sounding", cCyan, w) + "\n")
+	ref, good := m.snap.Reference()
+	if ref == nil {
+		b.WriteString(" " + stErr.Render("no usable sounding in 24h") + "\n")
+		return b.String()
+	}
+	name := strings.TrimSpace(ref.Name)
+	if max := w - 12; len(name) > max && max > 3 {
+		name = name[:max]
+	}
+	b.WriteString(" " + lipgloss.NewStyle().Foreground(cGreenB).Bold(true).
+		Render(ref.Code) + " " + stDim.Render(name) + "\n")
+	b.WriteString(" " + stFaint.Render(fmt.Sprintf("%.0f km away · sounded %s ago",
+		ref.KM, fmtAge(ref.Age()))) + "\n")
+	b.WriteString(" " + stFaint.Render("foF2 ") + scaled(ref.FoF2, 2, 14, "%5.2f") +
+		stFaint.Render("  MUF ") + scaled(ref.MUFD, 5, 40, "%5.2f") +
+		stFaint.Render("  foEs ") + scaled(ref.FoEs, 0, 10, "%5.2f") + "\n")
+	if !good {
+		b.WriteString(" " + stWarn.Render(fmt.Sprintf("⚠ low confidence (cs=%.0f)", ref.CS)) + "\n")
+	}
+	if m.snap.AustinKnown {
+		b.WriteString(" " + stErr.Render(fmt.Sprintf("⚠ AU930 Austin offline %s",
+			fmtAge(m.snap.AustinAge))) + "\n")
+	}
+	return b.String()
+}
+
+// ------------------------------------------------------------------- BANDS
+
+func (m model) viewBands() string {
+	if len(m.snap.Spots) == 0 {
+		return "\n" + stDim.Render("  no WSPR data yet — the collector fills this every 10 minutes.") + "\n"
+	}
+	var b strings.Builder
+
+	spotsByBand := map[int]int64{}
+	snrByBand := map[int]float64{}
+	kmByBand := map[int]float64{}
+	for _, s := range m.snap.Spots {
+		spotsByBand[s.Band] = s.Spots
+		snrByBand[s.Band] = s.AvgSNR
+		kmByBand[s.Band] = s.MaxKM
+	}
+
+	bucket := m.snap.SpotBucket.UTC().Format("15:04Z")
+	b.WriteString(section("LIVE BAND ACTIVITY",
+		fmt.Sprintf("worldwide WSPR · bucket ending %s · %s ago",
+			bucket, fmtAge(time.Since(m.snap.SpotBucket))), cAccent, m.w) + "\n")
+
+	ref, refGood := m.snap.Reference()
+
+	// Bands stay in FREQUENCY order rather than sorted by traffic: it keeps the
+	// spectrum colours running top to bottom as a gradient, and it means a band
+	// does not jump rows between refreshes.
+	barW := m.w - 58
+	if barW < 12 {
+		barW = 12
+	}
+	sparkW := 14
+
+	var bars []barchart.BarData
+	for _, bd := range Bands {
+		bars = append(bars, barchart.BarData{
+			Label: bd.Name,
+			Values: []barchart.BarValue{{
+				Name:  "spots",
+				Value: float64(spotsByBand[bd.WSPR]),
+				Style: lipgloss.NewStyle().Foreground(bandColor(bd.WSPR)),
+			}},
+		})
+	}
+	bc := barchart.New(barW, len(bars),
+		barchart.WithHorizontalBars(),
+		barchart.WithNoAxis(),
+		barchart.WithNoAutoBarWidth(),
+		barchart.WithBarWidth(1),
+		barchart.WithBarGap(0))
+	bc.PushAll(bars)
+	bc.Draw()
+	barLines := strings.Split(bc.View(), "\n")
+
+	b.WriteString(stHeader.Render(fmt.Sprintf("  %-5s %-*s %7s  %-10s %6s %7s  %s",
+		"BAND", barW, "ACTIVITY", "SPOTS", "STATUS", "SNR", "BEST KM", "24H TREND")) + "\n")
+
+	for i, bd := range Bands {
+		bar := ""
+		if i < len(barLines) {
+			bar = barLines[i]
+		}
+		st := Classify(bd, ref, m.snap.Solar.HAF)
+		n := spotsByBand[bd.WSPR]
+
+		name := lipgloss.NewStyle().Foreground(bandColor(bd.WSPR)).Bold(true).
+			Render(fmt.Sprintf("%5s", bd.Name))
+
+		count := stFaint.Render(fmt.Sprintf("%7d", n))
+		if n > 0 {
+			count = stWhite.Render(fmt.Sprintf("%7d", n))
+		}
+
+		snr := stFaint.Render(fmt.Sprintf("%6s", "—"))
+		if n > 0 {
+			snr = scaled(snrByBand[bd.WSPR], -30, 0, "%6.1f")
+		}
+		km := stFaint.Render(fmt.Sprintf("%7s", "—"))
+		if kmByBand[bd.WSPR] > 0 {
+			km = stDim.Render(fmt.Sprintf("%7.0f", kmByBand[bd.WSPR]))
+		}
+
+		spark := inlineSpark(m.snap.Hist[bd.WSPR], sparkW, bandColor(bd.WSPR))
+
+		b.WriteString(fmt.Sprintf("  %s %s %s  %s %s %s  %s\n",
+			name, bar, count, statusBadge(st), snr, km, spark))
+	}
+
+	// --- the model behind the status column ---------------------------------
+	b.WriteString("\n")
+	if ref == nil {
+		b.WriteString(stErr.Render("  no usable sounding in the last 24h — status column is blank") + "\n")
+		return b.String()
+	}
+	b.WriteString(section("PROPAGATION MODEL",
+		fmt.Sprintf("%s · %s · %.0f km · %s old",
+			ref.Code, strings.TrimSpace(ref.Name), ref.KM, fmtAge(ref.Age())),
+		cCyan, m.w) + "\n")
+
+	b.WriteString("  " +
+		stFaint.Render("foF2 ") + scaled(ref.FoF2, 2, 14, "%.2f") + stFaint.Render(" MHz") +
+		stFaint.Render("   MUF(3000) ") + scaled(ref.MUFD, 5, 40, "%.2f") + stFaint.Render(" MHz") +
+		stFaint.Render("   foEs ") + scaled(ref.FoEs, 0, 10, "%.2f") + stFaint.Render(" MHz") +
+		stFaint.Render("   absorption ") + scaled(m.snap.Solar.HAF, 0, 20, "%.1f") + stFaint.Render(" MHz") + "\n")
+	if !refGood {
+		b.WriteString(stWarn.Render(fmt.Sprintf(
+			"  ⚠ low autoscaling confidence (cs=%.0f) — indicative only", ref.CS)) + "\n")
+	}
+	return b.String()
+}
+
+// --------------------------------------------------------------- WATERFALL
+
+// waterfallRow is one band's rendered strip plus the peak it was scaled to.
+type waterfallRow struct {
+	Band  Band
+	Cells string
+	Peak  float64
+}
+
+// buildWaterfall renders the band x time grid.
+//
+// Hand-rendered rather than using ntcharts' heatmap widget. That widget is
+// built for continuous XY functions: it wraps a linechart, reserves the canvas
+// edges for axes, and expects points sampled across GraphWidth() x
+// GraphHeight() -- and PushAllMatrixRow maps x=row, y=column, transposed from
+// the obvious reading. Points landing outside the graph area are dropped
+// silently, so the failure mode is a blank chart. Here the Y axis is eleven
+// NAMED bands, and resampling them to whatever GraphHeight() happens to be
+// would decouple the rows from their labels.
+//
+// Bands run high at the TOP, the way every receiver waterfall is drawn. Each
+// row is normalised to ITS OWN peak: on a shared scale 20m (peaking near 24000
+// spots a bucket) saturates all day while 6m (50) never leaves the bottom, and
+// the diurnal structure that is the whole point disappears.
+func (m model) buildWaterfall(gridW int) []waterfallRow {
+	n := len(m.snap.HistTimes)
+	if n == 0 || gridW <= 0 {
+		return nil
+	}
+	out := make([]waterfallRow, 0, len(Bands))
+	for i := len(Bands) - 1; i >= 0; i-- {
+		bd := Bands[i]
+		src := m.snap.Hist[bd.WSPR]
+		row := make([]float64, gridW)
+		peak := 0.0
+		for x := 0; x < gridW; x++ {
+			lo := x * n / gridW
+			hi := (x + 1) * n / gridW
+			if hi <= lo {
+				hi = lo + 1
+			}
+			p := 0.0
+			for j := lo; j < hi && j < len(src); j++ {
+				if src[j] > p {
+					p = src[j]
+				}
+			}
+			row[x] = p
+			if p > peak {
+				peak = p
+			}
+		}
+		var cells strings.Builder
+		for _, v := range row {
+			if v <= 0 || peak <= 0 {
+				cells.WriteString(lipgloss.NewStyle().
+					Foreground(lipgloss.Color("233")).Render("\u00b7"))
+				continue
+			}
+			// Linear, not log: the row is already normalised to its own peak,
+			// so linear spreads that band's quiet-to-open range across the
+			// whole ramp. Log would bunch it into the top third again.
+			frac := v / peak
+			cells.WriteString(lipgloss.NewStyle().
+				Foreground(rampColor(heatRamp, frac)).Render(shadeChar(frac)))
+		}
+		out = append(out, waterfallRow{Band: bd, Cells: cells.String(), Peak: peak})
+	}
+	return out
+}
+
+// waterfallAxis lays three timestamps under a grid of the given width.
+func (m model) waterfallAxis(gridW int, indent int, withLocal bool) string {
+	n := len(m.snap.HistTimes)
+	if n < 2 {
+		return ""
+	}
+	f := func(t time.Time) string {
+		if withLocal {
+			return fmtZL(t)
+		}
+		return t.UTC().Format("15:04Z")
+	}
+	first, mid, last := f(m.snap.HistTimes[0]), f(m.snap.HistTimes[n/2]), f(m.snap.HistTimes[n-1])
+	pad := gridW - len(first) - len(mid) - len(last)
+	if pad < 2 {
+		pad = 2
+	}
+	return strings.Repeat(" ", indent) + stFaint.Render(
+		first+strings.Repeat(" ", pad/2)+mid+
+			strings.Repeat(" ", pad-pad/2)+last)
+}
+
+func (m model) viewWaterfall() string {
+	if len(m.snap.HistTimes) < 2 {
+		return "\n" + stDim.Render("  not enough history yet for the waterfall.") + "\n"
+	}
+	var b strings.Builder
+
+	span := m.snap.HistTimes[len(m.snap.HistTimes)-1].Sub(m.snap.HistTimes[0])
+	b.WriteString(section("PROPAGATION WATERFALL",
+		fmt.Sprintf("spots per band \u00b7 %s of history \u00b7 %d buckets",
+			fmtAge(span), len(m.snap.HistTimes)), cAccent, m.w) + "\n")
+
+	gridW := m.w - 19
+	if gridW < 20 {
+		gridW = 20
+	}
+	if gridW > len(m.snap.HistTimes) {
+		gridW = len(m.snap.HistTimes)
+	}
+
+	for _, r := range m.buildWaterfall(gridW) {
+		peak := stFaint.Render("      \u2014")
+		if r.Peak > 0 {
+			peak = stDim.Render(fmt.Sprintf("%7.0f", r.Peak))
+		}
+		b.WriteString(lipgloss.NewStyle().Foreground(bandColor(r.Band.WSPR)).Bold(true).
+			Render(fmt.Sprintf("%6s ", r.Band.Name)) + r.Cells + peak + "\n")
+	}
+	b.WriteString(m.waterfallAxis(gridW, 7, true) + "\n")
+
+	b.WriteString("\n  " + stFaint.Render("quiet "))
+	for i := 0; i < len(heatRamp); i++ {
+		f := float64(i) / float64(len(heatRamp)-1)
+		b.WriteString(lipgloss.NewStyle().Foreground(heatRamp[i]).Render(shadeChar(f)))
+	}
+	b.WriteString(stFaint.Render(" busy   each band scaled to its own 24h peak") + "\n")
+	b.WriteString(stFaint.Render(
+		"  higher bands on top \u00b7 one column per time bucket, oldest left \u00b7 "+
+			"right column is that band's peak spots/10min") + "\n")
+	return b.String()
+}
+
+// ------------------------------------------------------------------- SOLAR
+
+func (m model) viewSolar() string {
+	if len(m.snap.ESSN) == 0 {
+		return "\n" + stDim.Render("  no solar data yet.") + "\n"
+	}
+	var b strings.Builder
+	sol := m.snap.Solar
+
+	b.WriteString(section("SOLAR DRIVERS",
+		fmt.Sprintf("effective values from ionosonde assimilation · %s old",
+			fmtAge(time.Since(sol.ESSNTime))), cYellow, m.w) + "\n")
+
+	gw := m.w - 46
+	if gw < 12 {
+		gw = 12
+	}
+
+	big := func(v float64) string {
+		return lipgloss.NewStyle().Foreground(rampColor(coolWarm, v/200)).Bold(true).
+			Render(fmt.Sprintf("%6.1f", v))
+	}
+	b.WriteString("  " + stDim.Render("solar flux  SFI ") + big(sol.SFI6h) + "  " +
+		gauge(sol.SFI6h, 300, gw, coolWarm) +
+		stFaint.Render(fmt.Sprintf("  24h avg %.0f", sol.SFI24h)) + "\n")
+	b.WriteString("  " + stDim.Render("sunspots    SSN ") + big(sol.SSN6h) + "  " +
+		gauge(sol.SSN6h, 200, gw, coolWarm) +
+		stFaint.Render(fmt.Sprintf("  24h avg %.0f", sol.SSN24h)) + "\n")
+	b.WriteString("  " + stDim.Render("geomagnetic Kp  ") +
+		lipgloss.NewStyle().Foreground(kpColor(sol.Kp)).Bold(true).
+			Render(fmt.Sprintf("%6.2f", sol.Kp)) + "  " +
+		gauge(sol.Kp, 9, gw, []lipgloss.Color{
+			lipgloss.Color("47"), lipgloss.Color("191"), lipgloss.Color("220"),
+			lipgloss.Color("208"), lipgloss.Color("202"), lipgloss.Color("196")}) +
+		"  " + lipgloss.NewStyle().Foreground(kpColor(sol.Kp)).Render(kpLabel(sol.Kp)) + "\n")
+
+	absC := cGreenB
+	if sol.HAF > 0 {
+		absC = rampColor(coolWarm, sol.HAF/20)
+	}
+	b.WriteString("  " + stDim.Render("absorption      ") +
+		lipgloss.NewStyle().Foreground(absC).Bold(true).
+			Render(fmt.Sprintf("%6.1f", sol.HAF)) + "  " +
+		gauge(sol.HAF, 20, gw, coolWarm) +
+		stFaint.Render("  MHz cutoff at the QTH (0 = no D layer, i.e. night)") + "\n")
+
+	b.WriteString(stFaint.Render(fmt.Sprintf(
+		"  official SWPC daily for %s: flux %.0f · sunspot number %d · flares C%d M%d X%d",
+		sol.Day.Format("Jan 02"), sol.DailyFlux, sol.DailySSN,
+		sol.XrayC, sol.XrayM, sol.XrayX)) + "\n")
+
+	// --- effective SSN over the last week ------------------------------------
+	chartH := m.h - 26
+	if chartH < 6 {
+		chartH = 6
+	}
+	if chartH > 14 {
+		chartH = 14
+	}
+	chartW := m.w - 2
+	if chartW < 30 {
+		chartW = 30
+	}
+
+	b.WriteString("\n" + section("EFFECTIVE SSN", "7 days · "+
+		lipgloss.NewStyle().Foreground(cGreenB).Render("━ 6h")+
+		stFaint.Render(" / ")+
+		lipgloss.NewStyle().Foreground(cAccent).Render("━ 24h"), cGreenB, m.w) + "\n")
+
+	// Axis styling is construction-only here -- there is a WithAxesStyles
+	// option but no SetAxesStyles method.
+	tsl := timeserieslinechart.New(chartW, chartH,
+		timeserieslinechart.WithAxesStyles(
+			lipgloss.NewStyle().Foreground(lipgloss.Color("238")),
+			lipgloss.NewStyle().Foreground(cFaint)))
+	tsl.SetDataSetStyle("6h", lipgloss.NewStyle().Foreground(cGreenB))
+	tsl.SetDataSetStyle("24h", lipgloss.NewStyle().Foreground(cAccent))
+
+	var minT, maxT time.Time
+	minY, maxY := 1e9, -1e9
+	for _, p := range m.snap.ESSN {
+		tsl.PushDataSet(p.Span, timeserieslinechart.TimePoint{Time: p.T, Value: p.SSN})
+		if minT.IsZero() || p.T.Before(minT) {
+			minT = p.T
+		}
+		if p.T.After(maxT) {
+			maxT = p.T
+		}
+		if p.SSN < minY {
+			minY = p.SSN
+		}
+		if p.SSN > maxY {
+			maxY = p.SSN
+		}
+	}
+	spanY := maxY - minY
+	if spanY < 1 {
+		spanY = 1
+	}
+	tsl.SetViewTimeAndYRange(minT, maxT, minY-spanY*0.1, maxY+spanY*0.1)
+	tsl.DrawBrailleDataSets([]string{"24h", "6h"})
+	b.WriteString(tsl.View() + "\n")
+
+	// --- 30-day daily flux ---------------------------------------------------
+	if len(m.snap.Daily) > 1 {
+		var flux []float64
+		for _, d := range m.snap.Daily {
+			flux = append(flux, d.Flux)
+		}
+		lo, hi := flux[0], flux[0]
+		for _, f := range flux {
+			if f < lo {
+				lo = f
+			}
+			if f > hi {
+				hi = f
+			}
+		}
+		// ntcharts' sparkline scales from ZERO and scrolls in from the right,
+		// so a 100..161 series in a wide canvas renders as uniform three-
+		// quarter bars with two thirds of the canvas blank. Size to the data
+		// and plot the offset from the minimum; the printed range keeps that
+		// honest.
+		spanF := hi - lo
+		if spanF <= 0 {
+			spanF = 1
+		}
+		norm := make([]float64, len(flux))
+		for i, f := range flux {
+			norm[i] = f - lo
+		}
+		sl := sparkline.New(len(norm), 3,
+			sparkline.WithStyle(lipgloss.NewStyle().Foreground(cCyan)),
+			sparkline.WithMaxValue(spanF))
+		sl.PushAll(norm)
+		sl.Draw()
+
+		b.WriteString("\n" + section("10.7cm FLUX",
+			fmt.Sprintf("%d days · range %.0f–%.0f · latest %.0f",
+				len(flux), lo, hi, flux[len(flux)-1]), cCyan, m.w) + "\n")
+		for _, ln := range strings.Split(sl.View(), "\n") {
+			b.WriteString("  " + ln + "\n")
+		}
+	}
+	return b.String()
+}
+
+// -------------------------------------------------------------- IONOSPHERE
+
+// Enough context to trust or distrust the band column, and no more. The full
+// GIRO list ran to thirty-odd stations, most of them on other continents, which
+// buried the one station that actually matters.
+const ionoListLimit = 8
+
+func (m model) viewIono() string {
+	var b strings.Builder
+	ref, good := m.snap.Reference()
+
+	// --- the station the model speaks for -----------------------------------
+	b.WriteString(section("REFERENCE SOUNDING", "what the BANDS tab computes from",
+		cGreenB, m.w) + "\n")
+	if ref == nil {
+		b.WriteString(" " + stErr.Render("no usable sounding in the last 24h") + "\n")
+	} else {
+		b.WriteString(" " + lipgloss.NewStyle().Foreground(cGreenB).Bold(true).
+			Render(ref.Code) + "  " + stWhite.Render(strings.TrimSpace(ref.Name)) + "\n")
+		conf := fmt.Sprintf("confidence %.0f", ref.CS)
+		if ref.CS < 0 {
+			conf = "not autoscaled"
+		}
+		b.WriteString(" " + stFaint.Render(fmt.Sprintf(
+			"%.0f km from Austin \u00b7 sounded %s \u00b7 %s ago \u00b7 %s",
+			ref.KM, fmtZL(ref.T), fmtAge(ref.Age()), conf)) + "\n")
+		if !good {
+			b.WriteString(" " + stWarn.Render(
+				"\u26a0 low autoscaling confidence \u2014 treat the band column as indicative") + "\n")
+		}
+		b.WriteString("\n")
+		val := func(label string, v float64, lo, hi float64, unit, why string) {
+			b.WriteString("   " + stDim.Render(fmt.Sprintf("%-8s", label)) +
+				scaled(v, lo, hi, "%6.2f") + stFaint.Render(" "+unit+"   "+why) + "\n")
+		}
+		val("foF2", ref.FoF2, 2, 14, "MHz", "highest frequency that reflects straight up")
+		val("MUF3000", ref.MUFD, 5, 40, "MHz", "max usable for one 3000 km hop")
+		val("foEs", ref.FoEs, 0, 10, "MHz", "sporadic-E; carries ~5x this obliquely")
+		if ref.HmF2 > 0 {
+			val("hmF2", ref.HmF2, 200, 450, "km ", "height of the F2 peak")
+		}
+		b.WriteString("   " + stDim.Render(fmt.Sprintf("%-8s", "absorb")) +
+			scaled(m.snap.Solar.HAF, 0, 20, "%6.2f") +
+			stFaint.Render(" MHz   D-region cutoff, sampled AT Austin") + "\n")
+	}
+
+	// --- why the reference is 2000 km away ----------------------------------
+	if m.snap.AustinKnown {
+		b.WriteString("\n" + section("WHY NOT AUSTIN", "", cRed, m.w) + "\n")
+		b.WriteString(" " + badge("OFFLINE", cRed) + " " + stDim.Render(fmt.Sprintf(
+			"AU930 \"Austin, TX, USA\" is 15 km away and would be ideal.")) + "\n")
+		b.WriteString(" " + stFaint.Render(fmt.Sprintf(
+			"Its last sounding was %s ago. GIRO's DIDBGetValues servlet now 404s, so",
+			fmtAge(m.snap.AustinAge))) + "\n")
+		b.WriteString(" " + stFaint.Render(
+			"there is no second route to it. Everything above is measured elsewhere.") + "\n")
+	}
+
+	// --- the short list ------------------------------------------------------
+	if len(m.snap.Soundings) > 0 {
+		shown := minInt(len(m.snap.Soundings), ionoListLimit)
+		b.WriteString("\n" + section("NEAREST LIVE SOUNDERS",
+			fmt.Sprintf("%d of %d reporting in the last 24h", shown, len(m.snap.Soundings)),
+			cCyan, m.w) + "\n")
+		// Widths mirror the row format below exactly; they drift apart the
+		// moment one is edited without the other.
+		b.WriteString(stHeader.Render(fmt.Sprintf("   %-7s%-27s%7s %6s %8s %6s %8s",
+			"CODE", "STATION", "KM", "foF2", "MUF3000", "CONF", "AGE")) + "\n")
+
+		for i, s := range m.snap.Soundings {
+			if i >= shown {
+				break
+			}
+			marker, nameSt := "  ", stDim
+			if ref != nil && s.Code == ref.Code {
+				marker = lipgloss.NewStyle().Foreground(cGreenB).Bold(true).Render(" \u25b8")
+				nameSt = lipgloss.NewStyle().Foreground(cGreenB).Bold(true)
+			}
+			conf, confSt := fmt.Sprintf("%6s", "n/s"), stFaint
+			if s.CS >= 0 {
+				conf = fmt.Sprintf("%6.0f", s.CS)
+				confSt = lipgloss.NewStyle().Foreground(rampColor(
+					[]lipgloss.Color{cRed, cYellow, cGreenB}, s.CS/100))
+			}
+			ageSt := lipgloss.NewStyle().Foreground(rampColor(
+				[]lipgloss.Color{cGreenB, lipgloss.Color("191"), cYellow,
+					lipgloss.Color("245"), cFaint}, s.Age().Hours()/12))
+			name := strings.TrimSpace(s.Name)
+			if len(name) > 27 {
+				name = name[:27]
+			}
+			b.WriteString(marker + " " +
+				nameSt.Render(fmt.Sprintf("%-7s", s.Code)) +
+				stDim.Render(fmt.Sprintf("%-27s", name)) +
+				stFaint.Render(fmt.Sprintf("%7.0f", s.KM)) + " " +
+				scaled(s.FoF2, 2, 14, "%6.2f") + " " +
+				scaled(s.MUFD, 5, 40, "%8.2f") + " " +
+				confSt.Render(conf) + " " +
+				ageSt.Render(fmt.Sprintf("%8s", fmtAge(s.Age()))) + "\n")
+		}
+		if len(m.snap.Soundings) > shown {
+			b.WriteString(stFaint.Render(fmt.Sprintf(
+				"   %d further stations omitted \u2014 all further away than %.0f km",
+				len(m.snap.Soundings)-shown, m.snap.Soundings[shown-1].KM)) + "\n")
+		}
+	}
+	return b.String()
+}

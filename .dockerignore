@@ -1,0 +1,6 @@
+.git
+.env
+propscope
+collector/
+README.md
+*.md

@@ -1,0 +1,107 @@
+# propscope -- HF propagation measurements, collected and displayed.
+#
+#   docker compose up -d          start postgres + the collector
+#   docker compose run --rm tui   open the TUI
+#
+# Everything is local. Nothing is published to the host except postgres on
+# 127.0.0.1, and that only so you can point psql or a host-built binary at it.
+name: propscope
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: propscope-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PGDATABASE:-propscope}
+      POSTGRES_USER: ${PGUSER:-propscope}
+      POSTGRES_PASSWORD: ${PGPASSWORD:?set PGPASSWORD in .env}
+      # Store timestamps as UTC. Every upstream publishes UTC, most of them
+      # naive, and postgres resolves a naive timestamp using the session
+      # timezone -- so a non-UTC server silently shifts every reading. The
+      # collector pins its own session too; this is belt and braces.
+      TZ: UTC
+    volumes:
+      # PostgreSQL 18 moved the data directory into a major-version subdir so
+      # that pg_upgrade --link works, so the mount point is /var/lib/postgresql
+      # and NOT /var/lib/postgresql/data. Mounting the old path makes 18 refuse
+      # to start with "there appears to be PostgreSQL data in ... (unused
+      # mount/volume)". See docker-library/postgres#1259.
+      - pgdata:/var/lib/postgresql
+    # Loopback only. There is no reason for this to be reachable off-box.
+    ports:
+      - "127.0.0.1:${PGPORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-propscope} -d ${PGDATABASE:-propscope}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  collector:
+    build:
+      context: ./collector
+    image: propscope/collector:1.0
+    container_name: propscope-collector
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: ${PGDATABASE:-propscope}
+      PGUSER: ${PGUSER:-propscope}
+      PGPASSWORD: ${PGPASSWORD:?set PGPASSWORD in .env}
+      # Your station. Distances to ionosondes and the D-RAP absorption sample
+      # are both taken from here. Defaults to Austin, TX.
+      QTH_LAT: ${QTH_LAT:-30.2672}
+      QTH_LON: ${QTH_LON:--97.7431}
+      # Optional ntfy push for geomagnetic storms and failing sources. Leave
+      # NTFY_ALERT_TOPIC empty and no notification is ever attempted.
+      NTFY_URL: ${NTFY_URL:-}
+      NTFY_ALERT_TOPIC: ${NTFY_ALERT_TOPIC:-}
+      NTFY_TOKEN: ${NTFY_TOKEN:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      TZ: UTC
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health',timeout=5).status==200 else 1)\""]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # The TUI. Not started by `up` -- it is interactive, so it lives behind a
+  # profile and you reach it with `docker compose run --rm tui`.
+  tui:
+    build:
+      context: .
+    image: propscope/tui:1.0
+    profiles: ["tui"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: ${PGDATABASE:-propscope}
+      PGUSER: ${PGUSER:-propscope}
+      PGPASSWORD: ${PGPASSWORD:?set PGPASSWORD in .env}
+      # Wall-clock timezone shown next to Zulu. Not the container's clock,
+      # which stays UTC -- this is where the operator is.
+      PROPSCOPE_TZ: ${PROPSCOPE_TZ:-America/Chicago}
+      # Passed through so the TUI can size itself and pick a colour profile.
+      TERM: ${TERM:-xterm-256color}
+    # A TUI needs both, and `compose run` alone does not set stdin_open.
+    stdin_open: true
+    tty: true
+
+volumes:
+  pgdata:
