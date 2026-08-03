@@ -83,6 +83,17 @@ Everything is environment variables; see `.env.example`. The two that matter:
 |---|---|---|
 | `QTH_LAT` / `QTH_LON` | Austin, TX | your station, decimal degrees, west negative |
 | `PROPSCOPE_TZ` | `America/Chicago` | wall clock shown beside Zulu |
+| `PROPSCOPE_COLOR` | auto | `truecolor`, `256` or `ansi` |
+
+**On colour.** The gradients are defined in 24-bit and quantised to whatever the
+terminal supports, so a truecolor terminal gets a continuous ramp rather than 20
+steps. Detection is not automatic in the way you would hope: `COLORTERM` does
+not survive an SSH hop, and the library everything uses decides by
+string-matching `TERM` for `256color` — which `xterm-ghostty`, `xterm-kitty` and
+friends do not contain. propscope therefore recognises known-modern terminals by
+name and assumes truecolor; anything unrecognised gets 256 colours, which is the
+safe floor. `NO_COLOR` is honoured. Override with `PROPSCOPE_COLOR` if the guess
+is wrong in either direction.
 
 Set `NTFY_ALERT_TOPIC` (and `NTFY_URL`) for a push when Kp reaches 5 or a data
 source fails repeatedly. Leave it unset and no notification is ever attempted.

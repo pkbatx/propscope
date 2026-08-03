@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 	_ "time/tzdata" // embed the tz database so PROPSCOPE_TZ works in a scratch container
 
@@ -180,9 +181,42 @@ func ensureColor() {
 	// constants MOST capable first -- TrueColor=0, ANSI256=1, ANSI=2, Ascii=3 --
 	// so "less capable than 256 colour" is `>`, not `<`. Getting this backwards
 	// compiles, runs, and silently never upgrades anything.
-	if lipgloss.ColorProfile() > termenv.ANSI256 {
-		lipgloss.SetColorProfile(termenv.ANSI256)
+	if lipgloss.ColorProfile() > wantProfile() {
+		lipgloss.SetColorProfile(wantProfile())
 	}
+}
+
+// wantProfile is the colour depth to force when termenv has under-detected.
+//
+// The gradients here are defined in 24-bit and quantised by lipgloss, so
+// truecolor is a visible upgrade rather than a nicety: the waterfall goes from
+// 20 discrete steps to a continuous ramp. Every terminal below advertises
+// truecolor and has for years; the trouble is only that COLORTERM does not
+// survive SSH, so nothing downstream can tell.
+//
+// PROPSCOPE_COLOR overrides: truecolor | 256 | ansi.
+func wantProfile() termenv.Profile {
+	switch strings.ToLower(os.Getenv("PROPSCOPE_COLOR")) {
+	case "truecolor", "24bit":
+		return termenv.TrueColor
+	case "256", "ansi256":
+		return termenv.ANSI256
+	case "ansi", "16":
+		return termenv.ANSI
+	}
+	if ct := strings.ToLower(os.Getenv("COLORTERM")); ct == "truecolor" || ct == "24bit" {
+		return termenv.TrueColor
+	}
+	term := strings.ToLower(os.Getenv("TERM"))
+	for _, known := range []string{"ghostty", "kitty", "wezterm", "alacritty",
+		"iterm", "contour", "foot", "rio"} {
+		if strings.Contains(term, known) {
+			return termenv.TrueColor
+		}
+	}
+	// Unknown terminal: 256 colours is the safe floor. Guessing truecolor here
+	// would render as garbage on anything that genuinely lacks it.
+	return termenv.ANSI256
 }
 
 func main() {
@@ -223,7 +257,7 @@ func main() {
 		// dumping is to look at it (`propscope -dump | less -R`) or to check the
 		// palette. Force 256 colours here; -plain opts back out for grep.
 		if !*plain {
-			lipgloss.SetColorProfile(termenv.ANSI256)
+			lipgloss.SetColorProfile(wantProfile())
 		}
 		m := initialModel(pool)
 		m.w, m.h, m.ready, m.loading = *width, *height, true, false

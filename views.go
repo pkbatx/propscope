@@ -223,7 +223,107 @@ func (m model) viewHome() string {
 			b.WriteString(m.waterfallAxis(gridW, 7, true) + "\n")
 		}
 	}
+
+	// Solar trend underneath, if the terminal is tall enough to take it. The
+	// waterfall answers "what has today looked like"; these answer "and is the
+	// sun trending up or down underneath it", which is the other half of
+	// deciding whether to bother tomorrow.
+	used := strings.Count(b.String(), "\n") + 6 // + chrome and footer
+	if m.h-used >= 9 {
+		b.WriteString("\n" + m.homeCharts(m.w, minInt(m.h-used-2, 12)))
+	}
 	return b.String()
+}
+
+// tsChart builds a braille time-series chart over one series.
+func tsChart(pts []timeserieslinechart.TimePoint, w, h int, c lipgloss.Color) string {
+	if len(pts) < 2 || w < 10 || h < 3 {
+		return ""
+	}
+	ch := timeserieslinechart.New(w, h,
+		timeserieslinechart.WithAxesStyles(
+			lipgloss.NewStyle().Foreground(lipgloss.Color("236")),
+			lipgloss.NewStyle().Foreground(cFaint)))
+	ch.SetStyle(lipgloss.NewStyle().Foreground(c))
+
+	minT, maxT := pts[0].Time, pts[0].Time
+	minY, maxY := pts[0].Value, pts[0].Value
+	for _, p := range pts {
+		ch.Push(p)
+		if p.Time.Before(minT) {
+			minT = p.Time
+		}
+		if p.Time.After(maxT) {
+			maxT = p.Time
+		}
+		if p.Value < minY {
+			minY = p.Value
+		}
+		if p.Value > maxY {
+			maxY = p.Value
+		}
+	}
+	// Pad so the trace never sits flat on an axis, and so a dead-flat series
+	// still gets a sane range rather than a zero-height one.
+	span := maxY - minY
+	if span < 1 {
+		span = 1
+	}
+	ch.SetViewTimeAndYRange(minT, maxT, minY-span*0.12, maxY+span*0.12)
+	ch.DrawBraille()
+	return ch.View()
+}
+
+// homeCharts puts the two solar trends side by side under the waterfall.
+func (m model) homeCharts(w, h int) string {
+	leftW := w/2 - 1
+	rightW := w - leftW - 2
+	if leftW < 20 || rightW < 20 {
+		return ""
+	}
+	chartH := h - 1
+
+	// --- effective SSN, 7 days ---------------------------------------------
+	var ssn []timeserieslinechart.TimePoint
+	for _, p := range m.snap.ESSN {
+		if p.Span == "6h" {
+			ssn = append(ssn, timeserieslinechart.TimePoint{Time: p.T, Value: p.SSN})
+		}
+	}
+	lo, hi := 0.0, 0.0
+	for i, p := range ssn {
+		if i == 0 || p.Value < lo {
+			lo = p.Value
+		}
+		if i == 0 || p.Value > hi {
+			hi = p.Value
+		}
+	}
+	left := section("EFFECTIVE SSN",
+		fmt.Sprintf("7d · %.0f–%.0f · now %.1f", lo, hi, m.snap.Solar.SSN6h),
+		cGreenB, leftW) + "\n" +
+		tsChart(ssn, leftW, chartH, cGreenB)
+
+	// --- 10.7cm flux, 30 days ------------------------------------------------
+	var flux []timeserieslinechart.TimePoint
+	for _, d := range m.snap.Daily {
+		flux = append(flux, timeserieslinechart.TimePoint{Time: d.D, Value: d.Flux})
+	}
+	flo, fhi := 0.0, 0.0
+	for i, p := range flux {
+		if i == 0 || p.Value < flo {
+			flo = p.Value
+		}
+		if i == 0 || p.Value > fhi {
+			fhi = p.Value
+		}
+	}
+	right := section("10.7cm FLUX",
+		fmt.Sprintf("30d · %.0f–%.0f · now %.0f", flo, fhi, m.snap.Solar.DailyFlux),
+		cCyan, rightW) + "\n" +
+		tsChart(flux, rightW, chartH, cCyan)
+
+	return lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", right)
 }
 
 func (m model) homeBands(w int) string {
@@ -520,7 +620,7 @@ func (m model) buildWaterfall(gridW int) []waterfallRow {
 			// whole ramp. Log would bunch it into the top third again.
 			frac := v / peak
 			cells.WriteString(lipgloss.NewStyle().
-				Foreground(rampColor(heatRamp, frac)).Render(shadeChar(frac)))
+				Foreground(heatAt(frac)).Render(shadeChar(frac)))
 		}
 		out = append(out, waterfallRow{Band: bd, Cells: cells.String(), Peak: peak})
 	}
@@ -579,9 +679,11 @@ func (m model) viewWaterfall() string {
 	b.WriteString(m.waterfallAxis(gridW, 7, true) + "\n")
 
 	b.WriteString("\n  " + stFaint.Render("quiet "))
-	for i := 0; i < len(heatRamp); i++ {
-		f := float64(i) / float64(len(heatRamp)-1)
-		b.WriteString(lipgloss.NewStyle().Foreground(heatRamp[i]).Render(shadeChar(f)))
+	// A wider legend now that the ramp is continuous rather than 20 steps.
+	const legendW = 28
+	for i := 0; i < legendW; i++ {
+		f := float64(i) / float64(legendW-1)
+		b.WriteString(lipgloss.NewStyle().Foreground(heatAt(f)).Render(shadeChar(f)))
 	}
 	b.WriteString(stFaint.Render(" busy   each band scaled to its own 24h peak") + "\n")
 	b.WriteString(stFaint.Render(

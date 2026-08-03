@@ -2,16 +2,22 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
 )
 
-// Everything here is indexed ANSI-256 rather than 24-bit hex, on purpose. This
-// box advertises xterm-ghostty through a compatibility stub that aliases
-// xterm-256color (see Terminfo in CLAUDE.md), so it does not describe
-// truecolor. Indexed colours render identically over SSH and locally; hex
-// would be quantised by termenv in ways that differ between the two.
+// Two kinds of colour live here, and the distinction matters.
+//
+// IDENTITY colours -- the per-band spectrum, status badges, Kp bands -- stay
+// indexed ANSI-256. They are names, not points on a scale, and an index renders
+// identically everywhere.
+//
+// GRADIENT colours -- the waterfall, gauges, scaled numbers -- are defined in
+// 24-bit and handed to lipgloss, which quantises to whatever profile is active
+// (see wantProfile in main.go). On a truecolor terminal the ramp is continuous;
+// on a 256-colour one it lands on the same cube an indexed ramp would have.
 
 // bandColor maps a band to its place on a warm-to-cool spectrum: 160m red
 // through 6m violet. It is decorative, but it is also a real mnemonic -- the
@@ -43,6 +49,79 @@ func bandColor(wsprCode int) lipgloss.Color {
 		return lipgloss.Color("141")
 	}
 	return lipgloss.Color("245")
+}
+
+// ---------------------------------------------------------------------------
+// Smooth colour ramps.
+//
+// These return 24-bit hex and let lipgloss quantise. That is the opposite of
+// what this file used to do, and the reason is that lipgloss downsamples hex to
+// the ACTIVE profile: on a truecolor terminal a gradient is genuinely smooth,
+// and on a 256-colour one it lands on the same cube it would have anyway. One
+// definition, best available output. The fixed indexed ramps below are kept for
+// the handful of places that want a specific named colour rather than a point
+// on a gradient.
+
+func hex(r, g, b float64) lipgloss.Color {
+	c := func(v float64) int {
+		i := int(v*255 + 0.5)
+		if i < 0 {
+			return 0
+		}
+		if i > 255 {
+			return 255
+		}
+		return i
+	}
+	return lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", c(r), c(g), c(b)))
+}
+
+func clamp01(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
+// heatAt is the waterfall colormap: near-black through blue, cyan, green and
+// yellow to red — the shape every receiver waterfall has used for decades.
+// Piecewise-linear in RGB, which is crude colour science but reads correctly
+// and, unlike a perceptual space, never muddies the mid-tones on a dark
+// terminal background.
+func heatAt(t float64) lipgloss.Color {
+	t = clamp01(t)
+	r := clamp01(1.5 - math.Abs(4*t-3))
+	g := clamp01(1.5 - math.Abs(4*t-2))
+	b := clamp01(1.5 - math.Abs(4*t-1))
+	// Fade the coldest end to near-black so "quiet" reads as absence.
+	if t < 0.12 {
+		f := t / 0.12
+		r, g, b = r*f, g*f, b*f
+	}
+	return hex(r, g, b)
+}
+
+// warmAt is for scalar readouts where higher simply means hotter: blue through
+// cyan and green to yellow, orange, red.
+func warmAt(t float64) lipgloss.Color {
+	t = clamp01(t)
+	switch {
+	case t < 0.25:
+		u := t / 0.25
+		return hex(0.10+0.05*u, 0.35+0.45*u, 0.95-0.05*u)
+	case t < 0.50:
+		u := (t - 0.25) / 0.25
+		return hex(0.15-0.05*u, 0.80+0.15*u, 0.90-0.55*u)
+	case t < 0.75:
+		u := (t - 0.50) / 0.25
+		return hex(0.10+0.90*u, 0.95-0.05*u, 0.35-0.25*u)
+	default:
+		u := (t - 0.75) / 0.25
+		return hex(1.0, 0.90-0.70*u, 0.10+0.05*u)
+	}
 }
 
 // heatRamp is a classic receiver-waterfall gradient: near-black through blue,
@@ -93,7 +172,7 @@ func scaled(v, lo, hi float64, format string) string {
 	if hi > lo {
 		frac = (v - lo) / (hi - lo)
 	}
-	return lipgloss.NewStyle().Foreground(rampColor(coolWarm, frac)).
+	return lipgloss.NewStyle().Foreground(warmAt(frac)).
 		Render(fmt.Sprintf(format, v))
 }
 
