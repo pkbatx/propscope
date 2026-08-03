@@ -202,6 +202,83 @@ func statusBadge(s Status) string {
 	return badge("NO DATA ", lipgloss.Color("238"))
 }
 
+// spectrumMaxMHz is the top of the frequency axis the sounding bars are drawn
+// against. 36 leaves headroom above 10m for the occasional MUF in the thirties
+// without wasting half the bar on frequencies nobody works.
+const spectrumMaxMHz = 36.0
+
+// spectrumBar draws one station's usable HF spectrum as a bar.
+//
+// This exists because a row of five numbers -- foF2, MUF, foEs, confidence,
+// age -- makes you do the propagation arithmetic yourself, for every station,
+// every time. The bar does it once: you see how far up the spectrum that
+// ionosphere reaches and where it stops being usable, in the same glance that
+// tells you which station it is.
+//
+// Shading matches the BANDS tab exactly, so the two screens teach each other:
+//
+//	█  at or below foF2      reflects vertically -- local and DX
+//	▓  foF2 .. MUF(3000)     skip only
+//	░  up to MUF x 1.15      marginal; MUF is a median
+//	·  above that            closed via F2
+func spectrumBar(fof2, mufd, haf float64, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i := 0; i < width; i++ {
+		f := (float64(i) + 0.5) / float64(width) * spectrumMaxMHz
+		switch {
+		case haf > 0 && f < haf:
+			b.WriteString(lipgloss.NewStyle().Foreground(cRed).Render("▁"))
+		case f <= fof2:
+			b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("47")).Render("█"))
+		case f <= mufd:
+			b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Render("▓"))
+		case f <= mufd*1.15:
+			b.WriteString(lipgloss.NewStyle().Foreground(cYellow).Render("░"))
+		default:
+			b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("236")).Render("·"))
+		}
+	}
+	return b.String()
+}
+
+// spectrumScale returns the tick row and the label row that sit above the bars,
+// so a position on the bar can be read back as an actual band.
+func spectrumScale(width int) (string, string) {
+	ticks := make([]rune, width)
+	labels := make([]rune, width)
+	for i := range ticks {
+		ticks[i] = ' '
+		labels[i] = ' '
+	}
+	put := func(s string, at int) {
+		start := at - len(s)/2
+		for i, r := range s {
+			if p := start + i; p >= 0 && p < width {
+				labels[p] = r
+			}
+		}
+	}
+	for _, bd := range Bands {
+		if bd.MHz > spectrumMaxMHz {
+			continue
+		}
+		col := int(bd.MHz / spectrumMaxMHz * float64(width))
+		if col >= width {
+			col = width - 1
+		}
+		ticks[col] = '┬'
+		// Label only every other band; all ten collide at any sane width.
+		switch bd.Name {
+		case "160m", "40m", "20m", "15m", "10m":
+			put(strings.TrimSuffix(bd.Name, "m"), col)
+		}
+	}
+	return stFaint.Render(string(ticks)), stFaint.Render(string(labels))
+}
+
 // sparkChars are the eight block heights used by the inline sparklines.
 var sparkChars = []rune{'▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
 

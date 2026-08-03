@@ -438,10 +438,10 @@ func (m model) homeSolar(w int) string {
 	if !good {
 		b.WriteString(" " + stWarn.Render(fmt.Sprintf("⚠ low confidence (cs=%.0f)", ref.CS)) + "\n")
 	}
-	if m.snap.AustinKnown {
-		b.WriteString(" " + stErr.Render(fmt.Sprintf("⚠ AU930 Austin offline %s",
-			fmtAge(m.snap.AustinAge))) + "\n")
-	}
+	// The dead Austin sounder is deliberately NOT mentioned here. It is a fixed
+	// fact that will not change, and a permanent warning is just noise on a
+	// screen you look at every day. The distance to the reference station above
+	// already says everything actionable; the IONOSPHERE tab carries the why.
 	return b.String()
 }
 
@@ -885,64 +885,95 @@ func (m model) viewIono() string {
 			stFaint.Render(" MHz   D-region cutoff, sampled AT Austin") + "\n")
 	}
 
-	// --- why the reference is 2000 km away ----------------------------------
-	if m.snap.AustinKnown {
-		b.WriteString("\n" + section("WHY NOT AUSTIN", "", cRed, m.w) + "\n")
-		b.WriteString(" " + badge("OFFLINE", cRed) + " " + stDim.Render(fmt.Sprintf(
-			"AU930 \"Austin, TX, USA\" is 15 km away and would be ideal.")) + "\n")
-		b.WriteString(" " + stFaint.Render(fmt.Sprintf(
-			"Its last sounding was %s ago. GIRO's DIDBGetValues servlet now 404s, so",
-			fmtAge(m.snap.AustinAge))) + "\n")
-		b.WriteString(" " + stFaint.Render(
-			"there is no second route to it. Everything above is measured elsewhere.") + "\n")
-	}
-
 	// --- the short list ------------------------------------------------------
 	if len(m.snap.Soundings) > 0 {
 		shown := minInt(len(m.snap.Soundings), ionoListLimit)
 		b.WriteString("\n" + section("NEAREST LIVE SOUNDERS",
 			fmt.Sprintf("%d of %d reporting in the last 24h", shown, len(m.snap.Soundings)),
 			cCyan, m.w) + "\n")
-		// Widths mirror the row format below exactly; they drift apart the
-		// moment one is edited without the other.
-		b.WriteString(stHeader.Render(fmt.Sprintf("   %-7s%-27s%7s %6s %8s %6s %8s",
-			"CODE", "STATION", "KM", "foF2", "MUF3000", "CONF", "AGE")) + "\n")
+
+		// Layout: identity on the left, the spectrum bar carrying the actual
+		// content in the middle, exact numbers on the right for when the bar is
+		// not enough. Fixed columns so the bars line up into a single block the
+		// eye can compare down, which is the entire point of drawing them.
+		const idW = 34
+		barW := m.w - idW - 26
+		if barW < 18 {
+			barW = 18
+		}
+		if barW > 40 {
+			barW = 40
+		}
+
+		// Every row is: marker(2) + space + ident(idW) + space + bar. The scale
+		// and header must start at exactly that offset or the ticks lie about
+		// which band a column is.
+		const barCol = 2 + 1 + idW + 1
+		ticks, labels := spectrumScale(barW)
+		pad := strings.Repeat(" ", barCol)
+		b.WriteString(pad + labels + "\n")
+		b.WriteString(pad + ticks + "\n")
+		b.WriteString(stHeader.Render(fmt.Sprintf("   %-*s ", idW, "STATION")) +
+			strings.Repeat(" ", barW) +
+			stHeader.Render(fmt.Sprintf(" %6s %6s %7s", "foF2", "MUF", "AGE")) + "\n")
 
 		for i, s := range m.snap.Soundings {
 			if i >= shown {
 				break
 			}
+			isRef := ref != nil && s.Code == ref.Code
+
 			marker, nameSt := "  ", stDim
-			if ref != nil && s.Code == ref.Code {
+			if isRef {
 				marker = lipgloss.NewStyle().Foreground(cGreenB).Bold(true).Render(" \u25b8")
 				nameSt = lipgloss.NewStyle().Foreground(cGreenB).Bold(true)
 			}
-			conf, confSt := fmt.Sprintf("%6s", "n/s"), stFaint
-			if s.CS >= 0 {
-				conf = fmt.Sprintf("%6.0f", s.CS)
-				confSt = lipgloss.NewStyle().Foreground(rampColor(
-					[]lipgloss.Color{cRed, cYellow, cGreenB}, s.CS/100))
+
+			// One identity column: name, then distance, so the eye reads
+			// "which station, how far" as a single phrase instead of hopping
+			// between two widely separated columns.
+			name := strings.TrimSpace(s.Name)
+			dist := fmt.Sprintf("%.0f km", s.KM)
+			room := idW - len(dist) - 2
+			if len(name) > room && room > 1 {
+				name = name[:room-1] + "\u2026"
 			}
+			ident := fmt.Sprintf("%-*s %s", room, name, dist)
+
 			ageSt := lipgloss.NewStyle().Foreground(rampColor(
 				[]lipgloss.Color{cGreenB, lipgloss.Color("191"), cYellow,
 					lipgloss.Color("245"), cFaint}, s.Age().Hours()/12))
-			name := strings.TrimSpace(s.Name)
-			if len(name) > 27 {
-				name = name[:27]
-			}
+
 			b.WriteString(marker + " " +
-				nameSt.Render(fmt.Sprintf("%-7s", s.Code)) +
-				stDim.Render(fmt.Sprintf("%-27s", name)) +
-				stFaint.Render(fmt.Sprintf("%7.0f", s.KM)) + " " +
-				scaled(s.FoF2, 2, 14, "%6.2f") + " " +
-				scaled(s.MUFD, 5, 40, "%8.2f") + " " +
-				confSt.Render(conf) + " " +
-				ageSt.Render(fmt.Sprintf("%8s", fmtAge(s.Age()))) + "\n")
+				nameSt.Render(ident) + " " +
+				spectrumBar(s.FoF2, s.MUFD, m.snap.Solar.HAF, barW) +
+				" " + scaled(s.FoF2, 2, 14, "%6.2f") +
+				" " + scaled(s.MUFD, 5, 40, "%6.1f") +
+				" " + ageSt.Render(fmt.Sprintf("%7s", fmtAge(s.Age()))) + "\n")
 		}
+
+		b.WriteString("\n  " +
+			lipgloss.NewStyle().Foreground(lipgloss.Color("47")).Render("\u2588") +
+			stFaint.Render(" NVIS + DX   ") +
+			lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Render("\u2593") +
+			stFaint.Render(" DX only   ") +
+			lipgloss.NewStyle().Foreground(cYellow).Render("\u2591") +
+			stFaint.Render(" marginal   ") +
+			lipgloss.NewStyle().Foreground(lipgloss.Color("236")).Render("\u00b7") +
+			stFaint.Render(" closed") + "\n")
+
 		if len(m.snap.Soundings) > shown {
 			b.WriteString(stFaint.Render(fmt.Sprintf(
-				"   %d further stations omitted \u2014 all further away than %.0f km",
+				"  %d further stations omitted, all beyond %.0f km",
 				len(m.snap.Soundings)-shown, m.snap.Soundings[shown-1].KM)) + "\n")
+		}
+		// One quiet line, not a section: the dead local sounder is a permanent
+		// fact, so it belongs as a footnote here rather than as a standing
+		// warning on the dashboard.
+		if m.snap.AustinKnown {
+			b.WriteString(stFaint.Render(fmt.Sprintf(
+				"  AU930 Austin TX (15 km) has not reported for %s \u2014 hence the distance above.",
+				fmtAge(m.snap.AustinAge))) + "\n")
 		}
 	}
 	return b.String()
